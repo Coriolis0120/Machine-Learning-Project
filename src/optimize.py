@@ -1,7 +1,7 @@
 # src/optimize.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Tuple, List
 
 import torch
@@ -192,7 +192,7 @@ def train_once(
 @dataclass
 class SearchConfig:
     num_restarts: int = 200
-    train_cfg: TrainConfig = TrainConfig()
+    train_cfg: TrainConfig = field(default_factory=TrainConfig)
     device: Optional[torch.device] = None
     dtype: torch.dtype = torch.float32
     verbose: bool = False
