@@ -33,6 +33,15 @@ class TrainConfig:
     repulsion_alpha: float = 10.0
     repulsion_lambda: float = 1e-3
 
+    # 平滑最大违规（聚焦最糟糕点对）
+    use_smooth_max: bool = True
+    smooth_max_alpha: float = 50.0     # 越大越近似 max
+    smooth_max_weight: float = 1.0     # 与总违规和的权重平衡
+
+    # 学习率调度
+    use_scheduler: bool = True
+    scheduler_eta_min_ratio: float = 0.1  # 余弦调度的最小 lr 比例
+
 
 @dataclass
 class TrainResult:
@@ -83,6 +92,16 @@ def loss_total(
     分散项用 exp(alpha * inner) 抑制过近点对（只是辅助，不是必须）。
     """
     L = loss_vio(U, threshold=cfg.threshold, normalize=True)
+
+    # 聚焦“最糟糕”超阈值对的平滑最大损失
+    if cfg.use_smooth_max:
+        U_n = normalize_rows(U)
+        G = U_n @ U_n.T
+        vals = _upper_triangle_values(G)
+        excess = torch.clamp(vals - cfg.threshold, min=0.0)
+        if excess.numel() > 0:
+            smax = torch.logsumexp(cfg.smooth_max_alpha * excess, dim=0) / cfg.smooth_max_alpha
+            L = L + cfg.smooth_max_weight * smax
 
     if cfg.use_repulsion:
         U_n = normalize_rows(U)
@@ -139,6 +158,11 @@ def train_once(
     U = U.clone().detach().requires_grad_(True)
 
     opt = torch.optim.Adam([U], lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # 余弦调度：前期更大胆，后期更细致
+    scheduler = None
+    if cfg.use_scheduler:
+        eta_min = cfg.lr * cfg.scheduler_eta_min_ratio
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.steps, eta_min=eta_min)
 
     # 2) bookkeeping
     best_report = feasibility_report(U.detach(), threshold=cfg.threshold, eps=cfg.eps, normalize=True)
@@ -156,6 +180,8 @@ def train_once(
             torch.nn.utils.clip_grad_norm_([U], max_norm=cfg.grad_clip)
 
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
 
         # 投影回球面，保持 ||u_i||=1（非常重要）
         if cfg.proj_each_step:
@@ -196,6 +222,14 @@ class SearchConfig:
     device: Optional[torch.device] = None
     dtype: torch.dtype = torch.float32
     verbose: bool = False
+    # 失败后的后续精炼设置
+    post_refine_on_fail: bool = True
+    post_refine_steps: int = 4000
+    post_refine_lr: Optional[float] = None
+    # 针对“接近阈值但未可行”的多候选精炼
+    refine_top_k: int = 5
+    refine_steps: int = 4000
+    refine_lr: Optional[float] = None
 
 
 @dataclass
@@ -226,6 +260,7 @@ def search_feasible(
 
     best_rep_overall: Optional[FeasibilityReport] = None
     best_U_overall: Optional[torch.Tensor] = None
+    candidates: List[Tuple[float, torch.Tensor, FeasibilityReport, int]] = []  # (max_inner, U, report, seed)
 
     for k in range(cfg.num_restarts):
         seed = base_seed + k
@@ -234,6 +269,9 @@ def search_feasible(
         if (best_rep_overall is None) or (res.best_report.max_inner < best_rep_overall.max_inner):
             best_rep_overall = res.best_report
             best_U_overall = res.U_best
+
+        # 记录候选，后续从靠近阈值的若干个里再精炼
+        candidates.append((res.best_report.max_inner, res.U_best, res.best_report, seed))
 
         if cfg.verbose:
             print(
@@ -253,8 +291,45 @@ def search_feasible(
                 success_seed=seed,
             )
 
-    # 没找到可行解，返回整体最优（通常是 max_inner 最小的那次）
+    # 若未找到可行解，按靠近阈值的若干候选做精炼
     assert best_rep_overall is not None and best_U_overall is not None
+    if cfg.post_refine_on_fail and len(candidates) > 0:
+        lr_ref = cfg.post_refine_lr if cfg.post_refine_lr is not None else max(1e-5, cfg.train_cfg.lr * 0.5)
+        if cfg.verbose:
+            print(f"[refine] start top-{min(len(candidates), max(1, cfg.refine_top_k))} candidates; lr_ref={lr_ref}")
+        # 选取 max_inner 最小的前 k 个候选
+        top_k = sorted(candidates, key=lambda x: x[0])[: max(1, cfg.refine_top_k)]
+        refined_best_rep = best_rep_overall
+        refined_best_U = best_U_overall
+
+        for idx, (max_inner_cand, U_cand, rep_cand, seed_cand) in enumerate(top_k, start=1):
+            if cfg.verbose:
+                print(
+                    f"[refine {idx}/{len(top_k)}] seed={seed_cand} "
+                    f"start from max_inner={max_inner_cand:.6f}, violations={rep_cand.num_violations}"
+                )
+            refine_steps = cfg.refine_steps if cfg.refine_steps is not None else cfg.post_refine_steps
+            refine_res = bump_and_refine(U_cand, cfg.train_cfg, steps=refine_steps, lr=lr_ref, verbose=cfg.verbose)
+            refined_rep = refine_res.best_report
+            # 更新整体最佳
+            if refined_rep.max_inner < refined_best_rep.max_inner:
+                refined_best_rep = refined_rep
+                refined_best_U = refine_res.U_best
+            if refined_rep.ok:
+                return SearchResult(
+                    success=True,
+                    n=n,
+                    m=m,
+                    U=refine_res.U_best,
+                    report=refined_rep,
+                    best_over_restarts=refined_rep,
+                    success_seed=None,
+                )
+
+        # 未可行则返回精炼后的最好结果
+        best_rep_overall = refined_best_rep
+        best_U_overall = refined_best_U
+
     return SearchResult(
         success=False,
         n=n,
@@ -300,6 +375,7 @@ def bump_and_refine(
     cfg: TrainConfig,
     steps: int = 2000,
     lr: float = 5e-3,
+    verbose: bool = False,
 ) -> TrainResult:
     """
     从已有构型出发，再跑一段局部优化（常用于“最优但不可行”的构型继续挤）。
@@ -334,6 +410,12 @@ def bump_and_refine(
             history["loss"].append(float(L.detach().item()))
             history["max_inner"].append(rep.max_inner)
             history["violations"].append(float(rep.num_violations))
+
+            if verbose:
+                print(
+                    f"[refine step {t:6d}] loss={history['loss'][-1]:.4e} "
+                    f"max_inner={rep.max_inner:.6f} violations={rep.num_violations}"
+                )
 
             if rep.max_inner < best_report.max_inner:
                 best_report = rep

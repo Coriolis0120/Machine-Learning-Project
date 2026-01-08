@@ -1,2 +1,13 @@
 # --- Python virtual environments ---
 .venv/
+
+# output directories ---
+outputs/
+
+# --- Python cache files ---
+src/__pycache__/
+__pycache__/
+
+results/
+
+result.pt
