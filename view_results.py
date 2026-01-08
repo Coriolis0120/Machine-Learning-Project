@@ -1,7 +1,10 @@
+import os
 import torch
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-def plot_kissing_spheres(file_path):
+def plot_kissing_spheres(file_path, save_dir="outputs", show=False):
     data = torch.load(file_path)
     U = data['U'].cpu().numpy() # 转为 numpy 方便绘图
     
@@ -27,7 +30,18 @@ def plot_kissing_spheres(file_path):
         ax.plot([0, point[0]], [0, point[1]], [0, point[2]], 'k--', alpha=0.3)
 
     ax.set_title(f"Kissing Number Visualization (n=3, m={data['m']})")
-    plt.show()
+    # 保存到指定文件夹
+    os.makedirs(save_dir, exist_ok=True)
+    filename = f"kissing_n{data['n']}_m{data['m']}.png"
+    save_path = os.path.join(save_dir, filename)
+    plt.savefig(save_path, dpi=200, bbox_inches='tight')
+
+    if show:
+        plt.show()
+    else:
+        plt.close()
+
+    print(f"图像已保存至: {save_path}")
 
 if __name__ == "__main__":
     plot_kissing_spheres("result.pt")
