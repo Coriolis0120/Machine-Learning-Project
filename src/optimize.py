@@ -2,12 +2,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Tuple, List
 
 import torch
 
 from .evaluator import normalize_rows, feasibility_report, FeasibilityReport
 
+
+# -----------------------------
+# Config / Result dataclasses
+# -----------------------------
 
 @dataclass
 class TrainConfig:
@@ -42,6 +46,14 @@ class TrainConfig:
     use_scheduler: bool = True
     scheduler_eta_min_ratio: float = 0.1  # 余弦调度的最小 lr 比例
 
+    # -----------------------------
+    # NEW: 贪心初始化（泛化到任意维度）
+    # -----------------------------
+    init_method: str = "greedy"  # "random" | "greedy"
+    greedy_candidates: int = 2048
+    greedy_first_candidates: int = 8192  # 前几步用更大候选数更稳
+    greedy_first_steps: int = 8          # 前多少个点使用 greedy_first_candidates
+
 
 @dataclass
 class TrainResult:
@@ -50,6 +62,10 @@ class TrainResult:
     best_report: FeasibilityReport
     history: Dict[str, List[float]]
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
 
 def _upper_triangle_values(G: torch.Tensor) -> torch.Tensor:
     """
@@ -60,6 +76,15 @@ def _upper_triangle_values(G: torch.Tensor) -> torch.Tensor:
     return G[iu[0], iu[1]]
 
 
+@torch.no_grad()
+def _set_seed(seed: Optional[int]) -> None:
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def loss_vio(
     U: torch.Tensor,
     threshold: float = 0.5,
@@ -67,33 +92,20 @@ def loss_vio(
 ) -> torch.Tensor:
     """
     软约束损失：sum_{i<j} [max(0, <u_i,u_j> - threshold)]^2
-
-    说明：
-    - 这是可微的，适合 Adam/SGD。
-    - normalize=True 时先按行归一化，避免长度漂移破坏几何含义。
     """
-    if normalize:
-        U_n = normalize_rows(U)
-    else:
-        U_n = U
-
-    G = U_n @ U_n.T  # (m, m)
-    vals = _upper_triangle_values(G)  # (num_pairs,)
+    U_n = normalize_rows(U) if normalize else U
+    G = U_n @ U_n.T
+    vals = _upper_triangle_values(G)
     vio = torch.clamp(vals - threshold, min=0.0)
     return (vio * vio).sum()
 
 
-def loss_total(
-    U: torch.Tensor,
-    cfg: TrainConfig,
-) -> torch.Tensor:
+def loss_total(U: torch.Tensor, cfg: TrainConfig) -> torch.Tensor:
     """
-    总损失：违规损失 + （可选）分散项
-    分散项用 exp(alpha * inner) 抑制过近点对（只是辅助，不是必须）。
+    总损失：违规损失 + （可选）平滑最大 +（可选）分散项
     """
     L = loss_vio(U, threshold=cfg.threshold, normalize=True)
 
-    # 聚焦“最糟糕”超阈值对的平滑最大损失
     if cfg.use_smooth_max:
         U_n = normalize_rows(U)
         G = U_n @ U_n.T
@@ -113,25 +125,103 @@ def loss_total(
     return L
 
 
-def init_U(
+# -----------------------------
+# Initialization
+# -----------------------------
+
+@torch.no_grad()
+def init_U_random(
     m: int,
     n: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
     seed: Optional[int] = None,
 ) -> torch.Tensor:
-    """
-    随机初始化 U (m,n)，并投影到单位球面。
-    """
-    if seed is not None:
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-
+    _set_seed(seed)
     U = torch.randn(m, n, device=device, dtype=dtype)
-    U = normalize_rows(U)
-    return U
+    return normalize_rows(U)
 
+
+@torch.no_grad()
+def init_U_greedy_maximin(
+    m: int,
+    n: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    seed: Optional[int] = None,
+    candidates: int = 2048,
+    first_candidates: int = 8192,
+    first_steps: int = 8,
+) -> torch.Tensor:
+    """
+    贪心 maximin / farthest-point 初始化（泛化到任意 n, m）：
+
+    逐点加入：每次从若干随机候选中选择一个，使其与当前已选点集的“最大内积”最小：
+        choose x = argmin_x  max_{u in S} <x, u>
+
+    经验上对 spherical code / packing 的 max-inner 约束极其有效。
+    """
+    _set_seed(seed)
+
+    # 第一个点随便取
+    u0 = normalize_rows(torch.randn(1, n, device=device, dtype=dtype))
+    U_list = [u0]  # each is (1,n)
+
+    for k in range(1, m):
+        K = first_candidates if k < first_steps else candidates
+        C = normalize_rows(torch.randn(K, n, device=device, dtype=dtype))  # (K,n)
+
+        S = torch.cat(U_list, dim=0)  # (k,n)
+        # inner: (K,k), max_inner: (K,)
+        max_inner = (C @ S.T).max(dim=1).values
+
+        best_idx = torch.argmin(max_inner)
+        U_list.append(C[best_idx : best_idx + 1])
+
+    return torch.cat(U_list, dim=0)
+
+
+def init_U(
+    m: int,
+    n: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    seed: Optional[int] = None,
+    cfg: Optional[TrainConfig] = None,
+) -> torch.Tensor:
+    """
+    初始化 U (m,n)，并投影到单位球面。
+    默认使用贪心 maximin 初始化（可通过 cfg.init_method 改回 random）。
+    """
+    method = "greedy" if cfg is None else cfg.init_method.lower().strip()
+
+    if method == "random":
+        return init_U_random(m=m, n=n, device=device, dtype=dtype, seed=seed)
+
+    if method == "greedy":
+        if cfg is None:
+            # fallback default params
+            return init_U_greedy_maximin(
+                m=m, n=n, device=device, dtype=dtype, seed=seed,
+                candidates=2048, first_candidates=8192, first_steps=8
+            )
+        return init_U_greedy_maximin(
+            m=m,
+            n=n,
+            device=device,
+            dtype=dtype,
+            seed=seed,
+            candidates=cfg.greedy_candidates,
+            first_candidates=cfg.greedy_first_candidates,
+            first_steps=cfg.greedy_first_steps,
+        )
+
+    raise ValueError(f"Unknown init_method={method!r}. Use 'random' or 'greedy'.")
+
+
+# -----------------------------
+# Training (Adam)
+# -----------------------------
 
 def train_once(
     n: int,
@@ -142,23 +232,17 @@ def train_once(
     verbose: bool = False,
 ) -> TrainResult:
     """
-    单次训练：随机初始化 + Adam 优化，尝试找到可行点集。
-
-    返回：
-    - success：是否找到可行解
-    - U_best：训练过程中最好的构型（按 max_inner 最小）
-    - best_report：对应的评测
-    - history：记录 loss / max_inner / violations 轨迹（用于画图写报告）
+    单次训练：初始化 + Adam 优化，尝试找到可行点集。
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1) init
-    U = init_U(m=m, n=n, device=device, seed=seed)
-    U = U.clone().detach().requires_grad_(True)
+    # 1) init (NEW: greedy)
+    U0 = init_U(m=m, n=n, device=device, dtype=torch.float32, seed=seed, cfg=cfg)
+    U = U0.clone().detach().requires_grad_(True)
 
     opt = torch.optim.Adam([U], lr=cfg.lr, weight_decay=cfg.weight_decay)
-    # 余弦调度：前期更大胆，后期更细致
+
     scheduler = None
     if cfg.use_scheduler:
         eta_min = cfg.lr * cfg.scheduler_eta_min_ratio
@@ -183,12 +267,10 @@ def train_once(
         if scheduler is not None:
             scheduler.step()
 
-        # 投影回球面，保持 ||u_i||=1（非常重要）
         if cfg.proj_each_step:
             with torch.no_grad():
                 U.copy_(normalize_rows(U))
 
-        # 日志与可行性检查
         if (t % cfg.check_every == 0) or (t == cfg.steps):
             rep = feasibility_report(U.detach(), threshold=cfg.threshold, eps=cfg.eps, normalize=True)
 
@@ -196,7 +278,6 @@ def train_once(
             history["max_inner"].append(rep.max_inner)
             history["violations"].append(float(rep.num_violations))
 
-            # 以 max_inner 作为“最好”的排序标准：越小越好
             if rep.max_inner < best_report.max_inner:
                 best_report = rep
                 U_best = U.detach().clone()
@@ -208,12 +289,15 @@ def train_once(
                 )
 
             if cfg.early_stop and rep.ok:
-                return TrainResult(success=True, U_best=U.detach().clone(), best_report=rep, history=history)
+                return TrainResult(True, U.detach().clone(), rep, history)
 
-    # 结束：返回最好的（可能不可行）
     final_rep = feasibility_report(U_best, threshold=cfg.threshold, eps=cfg.eps, normalize=True)
-    return TrainResult(success=final_rep.ok, U_best=U_best, best_report=final_rep, history=history)
+    return TrainResult(final_rep.ok, U_best, final_rep, history)
 
+
+# -----------------------------
+# Search config / result
+# -----------------------------
 
 @dataclass
 class SearchConfig:
@@ -222,10 +306,12 @@ class SearchConfig:
     device: Optional[torch.device] = None
     dtype: torch.dtype = torch.float32
     verbose: bool = False
+
     # 失败后的后续精炼设置
     post_refine_on_fail: bool = True
     post_refine_steps: int = 4000
     post_refine_lr: Optional[float] = None
+
     # 针对“接近阈值但未可行”的多候选精炼
     refine_top_k: int = 5
     refine_steps: int = 4000
@@ -270,7 +356,6 @@ def search_feasible(
             best_rep_overall = res.best_report
             best_U_overall = res.U_best
 
-        # 记录候选，后续从靠近阈值的若干个里再精炼
         candidates.append((res.best_report.max_inner, res.U_best, res.best_report, seed))
 
         if cfg.verbose:
@@ -295,9 +380,10 @@ def search_feasible(
     assert best_rep_overall is not None and best_U_overall is not None
     if cfg.post_refine_on_fail and len(candidates) > 0:
         lr_ref = cfg.post_refine_lr if cfg.post_refine_lr is not None else max(1e-5, cfg.train_cfg.lr * 0.5)
+
         if cfg.verbose:
             print(f"[refine] start top-{min(len(candidates), max(1, cfg.refine_top_k))} candidates; lr_ref={lr_ref}")
-        # 选取 max_inner 最小的前 k 个候选
+
         top_k = sorted(candidates, key=lambda x: x[0])[: max(1, cfg.refine_top_k)]
         refined_best_rep = best_rep_overall
         refined_best_U = best_U_overall
@@ -311,10 +397,11 @@ def search_feasible(
             refine_steps = cfg.refine_steps if cfg.refine_steps is not None else cfg.post_refine_steps
             refine_res = bump_and_refine(U_cand, cfg.train_cfg, steps=refine_steps, lr=lr_ref, verbose=cfg.verbose)
             refined_rep = refine_res.best_report
-            # 更新整体最佳
+
             if refined_rep.max_inner < refined_best_rep.max_inner:
                 refined_best_rep = refined_rep
                 refined_best_U = refine_res.U_best
+
             if refined_rep.ok:
                 return SearchResult(
                     success=True,
@@ -326,7 +413,6 @@ def search_feasible(
                     success_seed=None,
                 )
 
-        # 未可行则返回精炼后的最好结果
         best_rep_overall = refined_best_rep
         best_U_overall = refined_best_U
 
@@ -341,7 +427,9 @@ def search_feasible(
     )
 
 
-# ------- 可选加分：突变 + 再优化（提高成功率） -------
+# -----------------------------
+# Optional: mutate + refine
+# -----------------------------
 
 @torch.no_grad()
 def mutate_U(
@@ -358,7 +446,6 @@ def mutate_U(
     m, n = U.shape
     U_new = U.clone()
 
-    # 替换部分点
     num_replace = max(1, int(p_replace * m)) if p_replace > 0 else 0
     if num_replace > 0:
         idx = torch.randperm(m, device=U.device)[:num_replace]
@@ -380,10 +467,6 @@ def bump_and_refine(
     """
     从已有构型出发，再跑一段局部优化（常用于“最优但不可行”的构型继续挤）。
     """
-    device = U_start.device
-    n = U_start.shape[1]
-    m = U_start.shape[0]
-
     cfg2 = TrainConfig(**{**cfg.__dict__, "steps": steps, "lr": lr})
 
     U = normalize_rows(U_start).clone().detach().requires_grad_(True)
